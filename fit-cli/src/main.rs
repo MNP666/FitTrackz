@@ -22,7 +22,7 @@
 use std::{env, process};
 
 use fit_core::{
-    parse_fit_file,
+    dump_raw_records, parse_fit_file,
     smoothing::{ExponentialMA, MovingAverage, Smoother},
 };
 
@@ -38,8 +38,28 @@ fn main() {
         process::exit(1);
     }
 
-    let path          = &args[1];
-    let channel       = args.get(2).map(String::as_str).unwrap_or("heart_rate");
+    let path    = &args[1];
+    let channel = args.get(2).map(String::as_str).unwrap_or("heart_rate");
+
+    // Special mode: dump raw fitparser field names from the first full record.
+    // Run this when a channel returns no data — it shows exactly what names
+    // fitparser assigns so you can correct the lookup in parser.rs.
+    //   cargo run --bin fit-cli -- run.fit dump
+    if channel == "dump" {
+        match dump_raw_records(path, 2) {
+            Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
+            Ok(records) => {
+                for (i, record) in records.iter().enumerate() {
+                    println!("=== Record {} ({} fields) ===", i + 1, record.len());
+                    for (name, value, units) in record {
+                        println!("  {name:<35} {value}  [{units}]");
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     let smoother_name = args.get(3).map(String::as_str).unwrap_or("none");
     let param: f64    = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10.0);
     let min_speed: Option<f64> = args.get(5).and_then(|s| s.parse().ok());

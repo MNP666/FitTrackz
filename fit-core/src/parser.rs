@@ -27,6 +27,52 @@ pub enum ParseError {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
+/// Return the raw field names and values from the first `max_records` Record
+/// messages that contain developer fields.  Used by `fit-cli dump` to discover
+/// exactly what names fitparser assigns so we can fix the parser if needed.
+///
+/// Each inner Vec is one record: `(field_name, display_value, units)`.
+pub fn dump_raw_records<P: AsRef<Path>>(
+    path: P,
+    max_records: usize,
+) -> Result<Vec<Vec<(String, String, String)>>, ParseError> {
+    let mut file = File::open(path)?;
+    let fit_data = fitparser::from_reader(&mut file)?;
+
+    let mut out = Vec::new();
+
+    for data_record in fit_data {
+        if data_record.kind() != fitparser::profile::MesgNum::Record {
+            continue;
+        }
+        let fields = data_record.fields();
+
+        // Only show records that have more than the basic fields (likely have
+        // developer data).  10 is a reasonable threshold based on the file.
+        if fields.len() < 10 {
+            continue;
+        }
+
+        let row: Vec<(String, String, String)> = fields
+            .iter()
+            .map(|f| {
+                (
+                    f.name().to_string(),
+                    format!("{:?}", f.value()),
+                    f.units().to_string(),
+                )
+            })
+            .collect();
+
+        out.push(row);
+        if out.len() >= max_records {
+            break;
+        }
+    }
+
+    Ok(out)
+}
+
 /// Parse a `.fit` file at the given path into a `FitActivity`.
 ///
 /// # Example

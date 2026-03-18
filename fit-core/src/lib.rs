@@ -9,4 +9,4 @@ pub mod smoothing;
 // Re-export the most useful types so callers can write `fit_core::FitActivity`
 // instead of `fit_core::models::FitActivity`.
 pub use models::{FitActivity, FitRecord};
-pub use parser::parse_fit_file;
+pub use parser::{dump_raw_records, parse_fit_file};
