@@ -2,6 +2,7 @@
 // This crate is pure Rust with no Python dependency — all the real logic lives here.
 // fit-cli uses it for the command line, and eventually fit-py will wrap it for Python.
 
+pub mod dev_fields;
 pub mod models;
 pub mod parser;
 pub mod smoothing;

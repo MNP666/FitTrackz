@@ -7,11 +7,16 @@
 //   - Converting fitparser's Value enum to Rust primitives
 //   - The FIT semicircle coordinate system
 //   - How Coros repurposes standard FIT field numbers for proprietary metrics
+//
+// Developer fields (Form Power, Leg Spring Stiffness, etc.) are NOT exposed
+// by fitparser 0.6 through its standard API.  We build them separately via
+// our own binary parser in dev_fields.rs and merge at decode time.
 
-use std::{fs::File, path::Path};
+use std::{fs, fs::File, path::Path};
 
 use fitparser::{FitDataField, Value};
 
+use crate::dev_fields::{build_dev_field_store, DevFieldStore};
 use crate::models::{FitActivity, FitRecord};
 
 // ── Error type ──────────────────────────────────────────────────────────────
@@ -28,16 +33,21 @@ pub enum ParseError {
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /// Return the raw field names and values from the first `max_records` Record
-/// messages that contain developer fields.  Used by `fit-cli dump` to discover
-/// exactly what names fitparser assigns so we can fix the parser if needed.
+/// messages that contain many fields.  Used by `fit-cli dump` to discover
+/// exactly what names fitparser assigns.
 ///
 /// Each inner Vec is one record: `(field_name, display_value, units)`.
 pub fn dump_raw_records<P: AsRef<Path>>(
     path: P,
     max_records: usize,
 ) -> Result<Vec<Vec<(String, String, String)>>, ParseError> {
-    let mut file = File::open(path)?;
+    // Standard fitparser fields
+    let mut file = File::open(path.as_ref())?;
     let fit_data = fitparser::from_reader(&mut file)?;
+
+    // Developer fields via our own binary parser
+    let raw = fs::read(path.as_ref())?;
+    let dev_store = build_dev_field_store(&raw);
 
     let mut out = Vec::new();
 
@@ -46,23 +56,28 @@ pub fn dump_raw_records<P: AsRef<Path>>(
             continue;
         }
         let fields = data_record.fields();
-
-        // Only show records that have more than the basic fields (likely have
-        // developer data).  10 is a reasonable threshold based on the file.
         if fields.len() < 10 {
             continue;
         }
 
-        let row: Vec<(String, String, String)> = fields
+        // Standard fields from fitparser
+        let mut row: Vec<(String, String, String)> = fields
             .iter()
-            .map(|f| {
-                (
-                    f.name().to_string(),
-                    format!("{:?}", f.value()),
-                    f.units().to_string(),
-                )
-            })
+            .map(|f| (f.name().to_string(), format!("{:?}", f.value()), f.units().to_string()))
             .collect();
+
+        // Developer fields from our binary parser, labelled clearly
+        if let Some(ts) = find_u32(fields, "timestamp") {
+            if let Some(dev) = dev_store.get(&ts) {
+                for (name, value) in dev {
+                    row.push((
+                        format!("[dev] {name}"),
+                        format!("{value:.4}"),
+                        String::new(),
+                    ));
+                }
+            }
+        }
 
         out.push(row);
         if out.len() >= max_records {
@@ -81,9 +96,14 @@ pub fn dump_raw_records<P: AsRef<Path>>(
 /// println!("{} records", activity.records.len());
 /// ```
 pub fn parse_fit_file<P: AsRef<Path>>(path: P) -> Result<FitActivity, ParseError> {
-    let mut file = File::open(path)?;
+    // ── Pass 1: build developer field store from raw bytes ───────────────────
+    // fitparser 0.6 does not expose developer fields through its API, so we
+    // read the raw bytes once and extract them ourselves.
+    let raw = fs::read(path.as_ref())?;
+    let dev_store = build_dev_field_store(&raw);
 
-    // fitparser::from_reader returns a Vec of FitDataRecord, one per FIT message.
+    // ── Pass 2: parse standard fields with fitparser ─────────────────────────
+    let mut file = File::open(path)?;
     let fit_data = fitparser::from_reader(&mut file)?;
 
     let mut sport: Option<String> = None;
@@ -92,16 +112,13 @@ pub fn parse_fit_file<P: AsRef<Path>>(path: P) -> Result<FitActivity, ParseError
     for data_record in fit_data {
         match data_record.kind() {
             fitparser::profile::MesgNum::Record => {
-                if let Some(record) = decode_record(data_record.fields()) {
+                if let Some(record) = decode_record(data_record.fields(), &dev_store) {
                     records.push(record);
                 }
             }
             fitparser::profile::MesgNum::Sport => {
-                // The "sport" message tells us what type of activity this is.
                 sport = find_string(data_record.fields(), "sport");
             }
-            // There are many other message types (Session, Lap, DeviceInfo…).
-            // We ignore them for now — great place to extend later.
             _ => {}
         }
     }
@@ -115,9 +132,15 @@ pub fn parse_fit_file<P: AsRef<Path>>(path: P) -> Result<FitActivity, ParseError
 /// Multiply by this constant to get degrees.
 const SEMICIRCLES_TO_DEGREES: f64 = 180.0 / (2u64.pow(31) as f64);
 
-fn decode_record(fields: &[FitDataField]) -> Option<FitRecord> {
+fn decode_record(fields: &[FitDataField], dev_store: &DevFieldStore) -> Option<FitRecord> {
     // Every record must have a timestamp; if it doesn't, skip it.
+    // find_u32 converts fitparser's Timestamp value to UNIX epoch seconds,
+    // which matches the keys in dev_store (also UNIX epoch).
     let timestamp = find_u32(fields, "timestamp")?;
+
+    // Look up developer fields for this exact timestamp.
+    let dev = dev_store.get(&timestamp);
+    let get_dev = |name: &str| -> Option<f64> { dev.and_then(|m| m.get(name)).copied() };
 
     Some(FitRecord {
         timestamp,
@@ -144,37 +167,23 @@ fn decode_record(fields: &[FitDataField]) -> Option<FitRecord> {
         vertical_oscillation: find_f64(fields, "vertical_oscillation"),
         stance_time:          find_f64(fields, "stance_time"),
 
-        // ── Coros running dynamics (repurposed FIT fields) ─────────────────────
+        // ── Coros running dynamics (repurposed standard FIT fields) ────────────
+        // Coros stores proprietary metrics in standard FIT field numbers.
+        // The raw integer values need ÷10 to reach the real unit.
         //
-        // Coros stores proprietary metrics in standard FIT field numbers that are
-        // either unused or mean something different in the FIT SDK.  The values
-        // are raw integers that need ÷10 to reach the real unit.
-        //
-        // Field 83 — FIT SDK name: "motor_power" (an e-bike field).
-        //            Coros uses it for a proprietary stride height metric (mm).
-        //
-        // Field 85 — FIT SDK name varies by profile version.
-        //            Coros uses it for stride length (mm).
-        //            Try "unknown_85" first; if that returns None, uncomment
-        //            the next .or_else() lines to try alternative names.
-        stride_height: find_f64(fields, "motor_power")
-                           .map(|v| v / 10.0),
+        // Field 83 ("motor_power" in FIT SDK) → Coros stride height, mm
+        // Field 85                            → Coros stride length, mm
+        stride_height: find_f64(fields, "motor_power").map(|v| v / 10.0),
+        stride_length: find_f64(fields, "unknown_85").map(|v| v / 10.0),
 
-        stride_length: find_f64(fields, "unknown_85")
-                           // Depending on fitparser version the field may have
-                           // a profile-derived name instead — uncomment if needed:
-                           // .or_else(|| find_f64(fields, "enhanced_respiration_rate"))
-                           // .or_else(|| find_f64(fields, "left_pedal_power_phase_peak"))
-                           .map(|v| v / 10.0),
-
-        // ── Coros developer fields ─────────────────────────────────────────────
-        // fitparser reads the FieldDescription messages embedded in the file and
-        // names these fields by their exact string from the watch firmware.
-        // We confirmed the names by inspecting the binary: "Form Power", etc.
-        form_power:           find_f64(fields, "Form Power"),
-        leg_spring_stiffness: find_f64(fields, "Leg Spring Stiffness"),
-        air_power:            find_f64(fields, "Air Power"),
-        impact_loading_rate:  find_f64(fields, "Impact Loading Rate"),
+        // ── Developer fields (Coros/Stryd) ─────────────────────────────────────
+        // These come from our binary parser in dev_fields.rs.
+        // Field names are the exact strings stored in the FIT FieldDescription
+        // messages and confirmed by binary inspection of long_run.fit.
+        form_power:           get_dev("Form Power"),
+        leg_spring_stiffness: get_dev("Leg Spring Stiffness"),
+        air_power:            get_dev("Air Power"),
+        impact_loading_rate:  get_dev("Impact Loading Rate"),
     })
 }
 
