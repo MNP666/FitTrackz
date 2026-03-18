@@ -27,21 +27,21 @@ pub struct FitRecord {
 
     // ── Standard running dynamics (FIT SDK fields, present on most GPS watches) ─
     /// Vertical displacement of the centre of mass per stride, in mm.
-    /// FIT field 39.  fitparser applies the ÷10 scale automatically.
+    /// FIT field 39.  Raw uint16 ÷ 10 = mm.
     pub vertical_oscillation: Option<f64>,  // mm
 
     /// Ground contact time per step, in ms.
-    /// FIT field 41.  fitparser applies the ÷10 scale automatically.
+    /// FIT field 41.  Raw uint16 ÷ 10 = ms.
     pub stance_time: Option<f64>,  // ms
 
     // ── Coros running dynamics ─────────────────────────────────────────────────
     // Coros repurposes two standard FIT field numbers for their own running
     // metrics.  The raw integer values need ÷10 to get the real unit.
     //
-    // If these come back as None after your first `cargo run`, add a temporary
-    // debug line in parser.rs to print all field names:
-    //   for f in fields { eprintln!("{} = {:?}", f.name(), f.value()); }
-    // That will show you exactly what name fitparser assigns to fields 83 and 85.
+    // If these come back as None, run `cargo run --bin fit-cli -- my.fit scan`
+    // to see all field numbers present in the binary and their value ranges.
+    // Identify the field whose values match expected stride sizes, then update
+    // the field numbers in decode_standard_field() in dev_fields.rs.
 
     /// Coros proprietary stride height (mm). Stored in FIT field 83.
     /// Raw integer ÷ 10 = mm.  Very similar to vertical_oscillation but

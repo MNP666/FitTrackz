@@ -22,7 +22,7 @@
 use std::{env, process};
 
 use fit_core::{
-    dump_raw_records, parse_fit_file,
+    dump_raw_records, parse_fit_file, scan_record_fields,
     smoothing::{ExponentialMA, MovingAverage, Smoother},
 };
 
@@ -41,9 +41,35 @@ fn main() {
     let path    = &args[1];
     let channel = args.get(2).map(String::as_str).unwrap_or("heart_rate");
 
-    // Special mode: dump raw fitparser field names from the first full record.
-    // Run this when a channel returns no data — it shows exactly what names
-    // fitparser assigns so you can correct the lookup in parser.rs.
+    // Special mode: scan every raw field number in Record messages and print
+    // value statistics.  Use this to hunt for unknown proprietary channels —
+    // look for field numbers whose value range matches what you expect:
+    //   stride_length ≈  900–1200  (mm × 10 in the raw encoding → 9000–12000)
+    //   stride_height ≈   50–80   (mm × 10 → 500–800)
+    //
+    //   cargo run --bin fit-cli -- run.fit scan
+    if channel == "scan" {
+        let raw = match std::fs::read(path) {
+            Ok(b)  => b,
+            Err(e) => { eprintln!("Error reading file: {e}"); process::exit(1); }
+        };
+        let stats = scan_record_fields(&raw);
+        println!("{:<6}  {:>7}  {:>12}  {:>12}  samples", "field", "records", "min", "max");
+        println!("{}", "-".repeat(62));
+        for s in &stats {
+            let sample_str: Vec<String> = s.samples.iter().map(|v| format!("{v:.0}")).collect();
+            println!(
+                "{:<6}  {:>7}  {:>12.2}  {:>12.2}  [{}]",
+                s.field_num, s.count, s.min, s.max,
+                sample_str.join(", ")
+            );
+        }
+        return;
+    }
+
+    // Special mode: dump all fields from the first few records in human-readable
+    // form.  Run this when a channel returns no data to see what is actually
+    // present.
     //   cargo run --bin fit-cli -- run.fit dump
     if channel == "dump" {
         match dump_raw_records(path, 2) {

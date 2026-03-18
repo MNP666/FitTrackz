@@ -1,92 +1,28 @@
-// parser.rs — wraps the `fitparser` crate and converts its generic types
-// into our own FitActivity / FitRecord types.
+// parser.rs — thin file-reading wrapper around the binary FIT parser.
 //
-// Key learning moments here:
-//   - std::fs::File + passing it to a library by mutable reference
-//   - Iterating over heterogeneous message types with match
-//   - Converting fitparser's Value enum to Rust primitives
-//   - The FIT semicircle coordinate system
-//   - How Coros repurposes standard FIT field numbers for proprietary metrics
+// All the real parsing lives in dev_fields::parse_fit_activity_from_bytes.
+// This module is responsible for I/O: reading the file into a byte buffer and
+// forwarding it to the parser.  The fitparser crate is no longer needed.
 //
-// Developer fields (Form Power, Leg Spring Stiffness, etc.) are NOT exposed
-// by fitparser 0.6 through its standard API.  We build them separately via
-// our own binary parser in dev_fields.rs and merge at decode time.
+// Learning notes:
+//   - fs::read returns Vec<u8>, which owns the bytes → no lifetime worries
+//   - The parser returns FitActivity directly, so no merge step needed
+//   - ParseError only needs the std::io::Error variant now
 
-use std::{fs, fs::File, path::Path};
+use std::{fs, path::Path};
 
-use fitparser::{FitDataField, Value};
-
-use crate::dev_fields::{build_dev_field_store, DevFieldStore};
+use crate::dev_fields::parse_fit_activity_from_bytes;
 use crate::models::{FitActivity, FitRecord};
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
-    #[error("could not open file: {0}")]
+    #[error("could not read file: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("fitparser error: {0}")]
-    Fit(#[from] fitparser::Error),
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
-
-/// Return the raw field names and values from the first `max_records` Record
-/// messages that contain many fields.  Used by `fit-cli dump` to discover
-/// exactly what names fitparser assigns.
-///
-/// Each inner Vec is one record: `(field_name, display_value, units)`.
-pub fn dump_raw_records<P: AsRef<Path>>(
-    path: P,
-    max_records: usize,
-) -> Result<Vec<Vec<(String, String, String)>>, ParseError> {
-    // Standard fitparser fields
-    let mut file = File::open(path.as_ref())?;
-    let fit_data = fitparser::from_reader(&mut file)?;
-
-    // Developer fields via our own binary parser
-    let raw = fs::read(path.as_ref())?;
-    let dev_store = build_dev_field_store(&raw);
-
-    let mut out = Vec::new();
-
-    for data_record in fit_data {
-        if data_record.kind() != fitparser::profile::MesgNum::Record {
-            continue;
-        }
-        let fields = data_record.fields();
-        if fields.len() < 10 {
-            continue;
-        }
-
-        // Standard fields from fitparser
-        let mut row: Vec<(String, String, String)> = fields
-            .iter()
-            .map(|f| (f.name().to_string(), format!("{:?}", f.value()), f.units().to_string()))
-            .collect();
-
-        // Developer fields from our binary parser, labelled clearly
-        if let Some(ts) = find_u32(fields, "timestamp") {
-            if let Some(dev) = dev_store.get(&ts) {
-                for (name, value) in dev {
-                    row.push((
-                        format!("[dev] {name}"),
-                        format!("{value:.4}"),
-                        String::new(),
-                    ));
-                }
-            }
-        }
-
-        out.push(row);
-        if out.len() >= max_records {
-            break;
-        }
-    }
-
-    Ok(out)
-}
 
 /// Parse a `.fit` file at the given path into a `FitActivity`.
 ///
@@ -96,145 +32,77 @@ pub fn dump_raw_records<P: AsRef<Path>>(
 /// println!("{} records", activity.records.len());
 /// ```
 pub fn parse_fit_file<P: AsRef<Path>>(path: P) -> Result<FitActivity, ParseError> {
-    // ── Pass 1: build developer field store from raw bytes ───────────────────
-    // fitparser 0.6 does not expose developer fields through its API, so we
-    // read the raw bytes once and extract them ourselves.
-    let raw = fs::read(path.as_ref())?;
-    let dev_store = build_dev_field_store(&raw);
+    let data = fs::read(path)?;
+    Ok(parse_fit_activity_from_bytes(&data))
+}
 
-    // ── Pass 2: parse standard fields with fitparser ─────────────────────────
-    let mut file = File::open(path)?;
-    let fit_data = fitparser::from_reader(&mut file)?;
+/// Return a human-readable dump of `max_records` representative Record
+/// messages.  Used by `fit-cli dump` to inspect what channels are present.
+/// Each inner Vec is one record: `(name, value, unit)`.
+///
+/// The function skips the first few records at the start of a run where GPS
+/// has not locked yet and developer fields have not all been registered,
+/// looking for records that carry the most data.
+pub fn dump_raw_records<P: AsRef<Path>>(
+    path: P,
+    max_records: usize,
+) -> Result<Vec<Vec<(String, String, String)>>, ParseError> {
+    let data = fs::read(path)?;
+    let activity = parse_fit_activity_from_bytes(&data);
 
-    let mut sport: Option<String> = None;
-    let mut records: Vec<FitRecord> = Vec::new();
+    let total = activity.records.len();
 
-    for data_record in fit_data {
-        match data_record.kind() {
-            fitparser::profile::MesgNum::Record => {
-                if let Some(record) = decode_record(data_record.fields(), &dev_store) {
-                    records.push(record);
-                }
-            }
-            fitparser::profile::MesgNum::Sport => {
-                sport = find_string(data_record.fields(), "sport");
-            }
-            _ => {}
+    // Find the first record that looks like proper mid-run data: has speed,
+    // heart rate, and at least one developer field.  Skip the first 30
+    // records in case the GPS or dev-field registration is still warming up.
+    let start = activity.records.iter()
+        .skip(30.min(total / 10))     // skip ≤10 % of the activity
+        .position(|r| r.speed.is_some() && r.heart_rate.is_some() && r.form_power.is_some())
+        .map(|i| i + 30.min(total / 10))
+        .unwrap_or(0);
+
+    let mut out = Vec::new();
+    for record in activity.records.iter().skip(start) {
+        out.push(record_to_row(record));
+        if out.len() >= max_records {
+            break;
         }
     }
-
-    Ok(FitActivity { sport, records })
+    Ok(out)
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-/// The FIT protocol stores lat/lon as 32-bit signed integers called "semicircles".
-/// Multiply by this constant to get degrees.
-const SEMICIRCLES_TO_DEGREES: f64 = 180.0 / (2u64.pow(31) as f64);
+/// Flatten a FitRecord into a list of (name, value_string, unit) tuples,
+/// skipping None fields.
+fn record_to_row(r: &FitRecord) -> Vec<(String, String, String)> {
+    let mut row = Vec::new();
 
-fn decode_record(fields: &[FitDataField], dev_store: &DevFieldStore) -> Option<FitRecord> {
-    // Every record must have a timestamp; if it doesn't, skip it.
-    // find_u32 converts fitparser's Timestamp value to UNIX epoch seconds,
-    // which matches the keys in dev_store (also UNIX epoch).
-    let timestamp = find_u32(fields, "timestamp")?;
-
-    // Look up developer fields for this exact timestamp.
-    let dev = dev_store.get(&timestamp);
-    let get_dev = |name: &str| -> Option<f64> { dev.and_then(|m| m.get(name)).copied() };
-
-    Some(FitRecord {
-        timestamp,
-
-        // ── GPS ────────────────────────────────────────────────────────────────
-        latitude:  find_i32(fields, "position_lat").map(|v| v as f64 * SEMICIRCLES_TO_DEGREES),
-        longitude: find_i32(fields, "position_long").map(|v| v as f64 * SEMICIRCLES_TO_DEGREES),
-
-        // ── Movement ───────────────────────────────────────────────────────────
-        altitude: find_f64(fields, "enhanced_altitude")
-                      .or_else(|| find_f64(fields, "altitude")),
-        speed:    find_f64(fields, "enhanced_speed")
-                      .or_else(|| find_f64(fields, "speed")),
-        distance: find_f64(fields, "distance"),
-
-        // ── Physiology ─────────────────────────────────────────────────────────
-        heart_rate: find_u8(fields, "heart_rate"),
-        cadence:    find_u8(fields, "cadence"),
-        power:      find_u32(fields, "power"),
-
-        // ── Standard running dynamics ──────────────────────────────────────────
-        // fitparser applies the FIT SDK scale/offset automatically, so both of
-        // these arrive in their final units (mm and ms respectively).
-        vertical_oscillation: find_f64(fields, "vertical_oscillation"),
-        stance_time:          find_f64(fields, "stance_time"),
-
-        // ── Coros running dynamics (repurposed standard FIT fields) ────────────
-        // Coros stores stride_height (field 83) and stride_length (field 85)
-        // in standard FIT field slots.  We extract them in dev_fields.rs where
-        // we can address fields by number, then retrieve them here the same
-        // way as developer fields.  This avoids depending on whatever name
-        // fitparser happens to assign to those field numbers.
-        stride_height: get_dev("stride_height"),
-        stride_length: get_dev("stride_length"),
-
-        // ── Developer fields (Coros/Stryd) ─────────────────────────────────────
-        // These come from our binary parser in dev_fields.rs.
-        // Field names are the exact strings stored in the FIT FieldDescription
-        // messages and confirmed by binary inspection of long_run.fit.
-        form_power:           get_dev("Form Power"),
-        leg_spring_stiffness: get_dev("Leg Spring Stiffness"),
-        air_power:            get_dev("Air Power"),
-        impact_loading_rate:  get_dev("Impact Loading Rate"),
-    })
-}
-
-// ── Field extractors — each looks up a named field and casts its Value ───────
-
-fn find_field<'a>(fields: &'a [FitDataField], name: &str) -> Option<&'a Value> {
-    fields.iter().find(|f| f.name() == name).map(|f| f.value())
-}
-
-fn find_u32(fields: &[FitDataField], name: &str) -> Option<u32> {
-    match find_field(fields, name)? {
-        Value::Timestamp(t) => Some(t.timestamp() as u32),
-        Value::UInt32(v)    => Some(*v),
-        Value::UInt16(v)    => Some(*v as u32),
-        Value::UInt8(v)     => Some(*v as u32),
-        _                   => None,
+    macro_rules! field {
+        ($name:expr, $val:expr, $unit:expr) => {
+            if let Some(v) = $val {
+                row.push(($name.to_string(), format!("{v:.4}"), $unit.to_string()));
+            }
+        };
     }
-}
 
-fn find_i32(fields: &[FitDataField], name: &str) -> Option<i32> {
-    match find_field(fields, name)? {
-        Value::SInt32(v) => Some(*v),
-        Value::SInt16(v) => Some(*v as i32),
-        _                => None,
-    }
-}
+    field!("timestamp",            Some(r.timestamp as f64), "s (UNIX)");
+    field!("latitude",             r.latitude,               "deg");
+    field!("longitude",            r.longitude,              "deg");
+    field!("altitude",             r.altitude,               "m");
+    field!("speed",                r.speed,                  "m/s");
+    field!("distance",             r.distance,               "m");
+    field!("heart_rate",           r.heart_rate.map(|v| v as f64), "bpm");
+    field!("cadence",              r.cadence.map(|v| v as f64),    "spm");
+    field!("power",                r.power.map(|v| v as f64),      "W");
+    field!("vertical_oscillation", r.vertical_oscillation,   "mm");
+    field!("stance_time",          r.stance_time,            "ms");
+    field!("stride_height",        r.stride_height,          "mm");
+    field!("stride_length",        r.stride_length,          "mm");
+    field!("form_power",           r.form_power,             "W");
+    field!("leg_spring_stiffness", r.leg_spring_stiffness,   "KN/m");
+    field!("air_power",            r.air_power,              "W");
+    field!("impact_loading_rate",  r.impact_loading_rate,    "BW/s");
 
-fn find_u8(fields: &[FitDataField], name: &str) -> Option<u8> {
-    match find_field(fields, name)? {
-        Value::UInt8(v)  => Some(*v),
-        Value::UInt16(v) => Some(*v as u8),
-        _                => None,
-    }
-}
-
-fn find_f64(fields: &[FitDataField], name: &str) -> Option<f64> {
-    match find_field(fields, name)? {
-        Value::Float64(v) => Some(*v),
-        Value::Float32(v) => Some(*v as f64),
-        Value::UInt32(v)  => Some(*v as f64),
-        Value::UInt16(v)  => Some(*v as f64),
-        Value::UInt8(v)   => Some(*v as f64),
-        Value::SInt32(v)  => Some(*v as f64),
-        Value::SInt16(v)  => Some(*v as f64),
-        _                 => None,
-    }
-}
-
-fn find_string(fields: &[FitDataField], name: &str) -> Option<String> {
-    match find_field(fields, name)? {
-        Value::String(s) => Some(s.clone()),
-        _                => None,
-    }
+    row
 }

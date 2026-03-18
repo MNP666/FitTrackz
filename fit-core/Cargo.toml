@@ -4,5 +4,4 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-fitparser = "0.6"
 thiserror = "1"   # ergonomic custom error types
