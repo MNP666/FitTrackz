@@ -172,8 +172,8 @@ pub fn build_dev_field_store(data: &[u8]) -> DevFieldStore {
                 continue;
             }
 
-            // ── Record (MesgNum 20) with developer fields ──────────────────
-            if global != 20 || dev_bytes.is_empty() {
+            // ── Record (MesgNum 20) — standard + developer fields ─────────
+            if global != 20 {
                 continue;
             }
 
@@ -201,6 +201,31 @@ pub fn build_dev_field_store(data: &[u8]) -> DevFieldStore {
                 let value = decode_value(bytes, *base_type, big_endian);
                 if let Some(v) = value {
                     record.insert(name.clone(), v);
+                }
+            }
+
+            // ── Coros-repurposed standard FIT fields ───────────────────────
+            // Coros PACE Pro stores proprietary stride metrics in standard FIT
+            // field numbers rather than as developer fields.  We extract them
+            // here so that decode_record in parser.rs can use the same
+            // get_dev() path for all Coros channels.
+            //
+            // Field 83 → stride_height (mm).  Raw uint16 ÷ 10 = mm.
+            // Field 85 → stride_length (mm).  Raw uint16 ÷ 10 = mm.
+            if let Some(bytes) = std_bytes.get(&83) {
+                if bytes.len() >= 2 {
+                    let raw = read_u16(bytes, big_endian) as f64;
+                    if raw > 0.0 {
+                        record.insert("stride_height".to_string(), raw / 10.0);
+                    }
+                }
+            }
+            if let Some(bytes) = std_bytes.get(&85) {
+                if bytes.len() >= 2 {
+                    let raw = read_u16(bytes, big_endian) as f64;
+                    if raw > 0.0 {
+                        record.insert("stride_length".to_string(), raw / 10.0);
+                    }
                 }
             }
 

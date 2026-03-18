@@ -168,13 +168,13 @@ fn decode_record(fields: &[FitDataField], dev_store: &DevFieldStore) -> Option<F
         stance_time:          find_f64(fields, "stance_time"),
 
         // ── Coros running dynamics (repurposed standard FIT fields) ────────────
-        // Coros stores proprietary metrics in standard FIT field numbers.
-        // The raw integer values need ÷10 to reach the real unit.
-        //
-        // Field 83 ("motor_power" in FIT SDK) → Coros stride height, mm
-        // Field 85                            → Coros stride length, mm
-        stride_height: find_f64(fields, "motor_power").map(|v| v / 10.0),
-        stride_length: find_f64(fields, "unknown_85").map(|v| v / 10.0),
+        // Coros stores stride_height (field 83) and stride_length (field 85)
+        // in standard FIT field slots.  We extract them in dev_fields.rs where
+        // we can address fields by number, then retrieve them here the same
+        // way as developer fields.  This avoids depending on whatever name
+        // fitparser happens to assign to those field numbers.
+        stride_height: get_dev("stride_height"),
+        stride_length: get_dev("stride_length"),
 
         // ── Developer fields (Coros/Stryd) ─────────────────────────────────────
         // These come from our binary parser in dev_fields.rs.

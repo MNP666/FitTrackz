@@ -1,3 +1,6 @@
 /target
 # Cargo.lock is committed here because this workspace contains a binary (fit-cli).
 # For pure library crates, you'd omit it.
+
+# data for testing
+/data
