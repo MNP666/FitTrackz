@@ -6,6 +6,7 @@
 //   - Iterating over heterogeneous message types with match
 //   - Converting fitparser's Value enum to Rust primitives
 //   - The FIT semicircle coordinate system
+//   - How Coros repurposes standard FIT field numbers for proprietary metrics
 
 use std::{fs::File, path::Path};
 
@@ -75,18 +76,59 @@ fn decode_record(fields: &[FitDataField]) -> Option<FitRecord> {
     Some(FitRecord {
         timestamp,
 
+        // ── GPS ────────────────────────────────────────────────────────────────
         latitude:  find_i32(fields, "position_lat").map(|v| v as f64 * SEMICIRCLES_TO_DEGREES),
         longitude: find_i32(fields, "position_long").map(|v| v as f64 * SEMICIRCLES_TO_DEGREES),
 
-        altitude:  find_f64(fields, "enhanced_altitude")
-                        .or_else(|| find_f64(fields, "altitude")),
-        speed:     find_f64(fields, "enhanced_speed")
-                        .or_else(|| find_f64(fields, "speed")),
-        distance:  find_f64(fields, "distance"),
+        // ── Movement ───────────────────────────────────────────────────────────
+        altitude: find_f64(fields, "enhanced_altitude")
+                      .or_else(|| find_f64(fields, "altitude")),
+        speed:    find_f64(fields, "enhanced_speed")
+                      .or_else(|| find_f64(fields, "speed")),
+        distance: find_f64(fields, "distance"),
 
+        // ── Physiology ─────────────────────────────────────────────────────────
         heart_rate: find_u8(fields, "heart_rate"),
         cadence:    find_u8(fields, "cadence"),
         power:      find_u32(fields, "power"),
+
+        // ── Standard running dynamics ──────────────────────────────────────────
+        // fitparser applies the FIT SDK scale/offset automatically, so both of
+        // these arrive in their final units (mm and ms respectively).
+        vertical_oscillation: find_f64(fields, "vertical_oscillation"),
+        stance_time:          find_f64(fields, "stance_time"),
+
+        // ── Coros running dynamics (repurposed FIT fields) ─────────────────────
+        //
+        // Coros stores proprietary metrics in standard FIT field numbers that are
+        // either unused or mean something different in the FIT SDK.  The values
+        // are raw integers that need ÷10 to reach the real unit.
+        //
+        // Field 83 — FIT SDK name: "motor_power" (an e-bike field).
+        //            Coros uses it for a proprietary stride height metric (mm).
+        //
+        // Field 85 — FIT SDK name varies by profile version.
+        //            Coros uses it for stride length (mm).
+        //            Try "unknown_85" first; if that returns None, uncomment
+        //            the next .or_else() lines to try alternative names.
+        stride_height: find_f64(fields, "motor_power")
+                           .map(|v| v / 10.0),
+
+        stride_length: find_f64(fields, "unknown_85")
+                           // Depending on fitparser version the field may have
+                           // a profile-derived name instead — uncomment if needed:
+                           // .or_else(|| find_f64(fields, "enhanced_respiration_rate"))
+                           // .or_else(|| find_f64(fields, "left_pedal_power_phase_peak"))
+                           .map(|v| v / 10.0),
+
+        // ── Coros developer fields ─────────────────────────────────────────────
+        // fitparser reads the FieldDescription messages embedded in the file and
+        // names these fields by their exact string from the watch firmware.
+        // We confirmed the names by inspecting the binary: "Form Power", etc.
+        form_power:           find_f64(fields, "Form Power"),
+        leg_spring_stiffness: find_f64(fields, "Leg Spring Stiffness"),
+        air_power:            find_f64(fields, "Air Power"),
+        impact_loading_rate:  find_f64(fields, "Impact Loading Rate"),
     })
 }
 
@@ -128,6 +170,9 @@ fn find_f64(fields: &[FitDataField], name: &str) -> Option<f64> {
         Value::Float32(v) => Some(*v as f64),
         Value::UInt32(v)  => Some(*v as f64),
         Value::UInt16(v)  => Some(*v as f64),
+        Value::UInt8(v)   => Some(*v as f64),
+        Value::SInt32(v)  => Some(*v as f64),
+        Value::SInt16(v)  => Some(*v as f64),
         _                 => None,
     }
 }

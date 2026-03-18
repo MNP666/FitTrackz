@@ -1,15 +1,23 @@
 // fit-cli: a thin command-line wrapper around fit-core.
 //
 // Usage:
-//   cargo run --bin fit-cli -- path/to/activity.fit [channel] [smoother] [param]
+//   cargo run --bin fit-cli -- <file.fit> [channel] [smoother] [param] [min_speed]
 //
 // Examples:
-//   cargo run --bin fit-cli -- my_run.fit                         # dump all records as CSV
-//   cargo run --bin fit-cli -- my_run.fit heart_rate              # raw HR as CSV
-//   cargo run --bin fit-cli -- my_run.fit heart_rate sma 10       # HR smoothed with SMA window=10
-//   cargo run --bin fit-cli -- my_run.fit heart_rate ema 0.2      # HR smoothed with EMA alpha=0.2
+//   cargo run --bin fit-cli -- run.fit                              # HR as CSV, no filter
+//   cargo run --bin fit-cli -- run.fit heart_rate                  # raw HR
+//   cargo run --bin fit-cli -- run.fit heart_rate sma 10           # HR with SMA window=10
+//   cargo run --bin fit-cli -- run.fit heart_rate sma 10 1.0       # skip red-light stops (<1 m/s)
+//   cargo run --bin fit-cli -- run.fit form_power ema 0.2 1.0      # form power, EMA, filtered
+//   cargo run --bin fit-cli -- run.fit leg_spring_stiffness sma 5  # leg stiffness, SMA
 //
-// Pipe the output to a file and plot it in Python with matplotlib.
+// Available channels:
+//   heart_rate, speed, altitude, power, cadence, distance,
+//   vertical_oscillation, stance_time,
+//   stride_height, stride_length,
+//   form_power, leg_spring_stiffness, air_power, impact_loading_rate
+//
+// Pipe output to a file and plot it in Python with matplotlib.
 
 use std::{env, process};
 
@@ -22,15 +30,19 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: fit-cli <file.fit> [channel] [sma|ema] [window|alpha]");
-        eprintln!("Channels: heart_rate, speed, altitude, power, cadence, distance");
+        eprintln!(
+            "Usage: fit-cli <file.fit> [channel] [sma|ema|none] [window|alpha] [min_speed_ms]"
+        );
+        eprintln!("  channel defaults to 'heart_rate'");
+        eprintln!("  min_speed_ms: drop records below this speed (m/s). Use 1.0 to skip red lights.");
         process::exit(1);
     }
 
-    let path = &args[1];
-    let channel = args.get(2).map(String::as_str).unwrap_or("heart_rate");
+    let path          = &args[1];
+    let channel       = args.get(2).map(String::as_str).unwrap_or("heart_rate");
     let smoother_name = args.get(3).map(String::as_str).unwrap_or("none");
-    let param: f64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10.0);
+    let param: f64    = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10.0);
+    let min_speed: Option<f64> = args.get(5).and_then(|s| s.parse().ok());
 
     // Parse the FIT file.
     let activity = match parse_fit_file(path) {
@@ -44,13 +56,22 @@ fn main() {
         activity.sport.as_deref().unwrap_or("unknown")
     );
 
-    // Extract the requested channel.
-    let channel_data = activity.extract_channel(channel);
+    // Extract the requested channel, with optional speed filter.
+    let channel_data = match min_speed {
+        Some(threshold) => {
+            eprintln!("Speed filter: dropping records below {threshold:.1} m/s");
+            activity.extract_channel_filtered(channel, threshold)
+        }
+        None => activity.extract_channel(channel),
+    };
 
     if channel_data.is_empty() {
         eprintln!("No data found for channel '{channel}'");
+        eprintln!("(If stride_height or stride_length is empty, see the comment in parser.rs)");
         process::exit(1);
     }
+
+    eprintln!("{} data points after filtering", channel_data.len());
 
     let (indices, raw_values): (Vec<usize>, Vec<f64>) = channel_data.into_iter().unzip();
 
@@ -63,13 +84,11 @@ fn main() {
 
     // Print CSV to stdout.  Timestamps come from the records at those indices.
     println!("timestamp,raw_{channel},smoothed_{channel}");
-    for (i, (&rec_idx, (&raw, &sm))) in indices
+    for (&rec_idx, (&raw, &sm)) in indices
         .iter()
         .zip(raw_values.iter().zip(smoothed.iter()))
-        .enumerate()
     {
         let ts = activity.records[rec_idx].timestamp;
         println!("{ts},{raw:.4},{sm:.4}");
-        let _ = i; // suppress unused warning
     }
 }
