@@ -128,7 +128,7 @@ impl FitActivity {
     /// know whether the watch was moving.
     ///
     /// # Example
-    /// ```no_run
+    /// ```ignore
     /// // Only include records where the runner is actually moving
     /// let data = activity.extract_channel_filtered("heart_rate", 1.0);
     /// ```
