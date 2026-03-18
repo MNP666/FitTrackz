@@ -32,18 +32,6 @@ pub type DevFieldStore = HashMap<u32, DevRecord>;
 /// (1970-01-01).  Add this to a raw FIT timestamp to get UNIX seconds.
 pub const FIT_EPOCH_OFFSET: u32 = 631_065_600;
 
-// ── FIT base type sizes (bytes) ───────────────────────────────────────────────
-
-fn base_type_size(base_type: u8) -> Option<usize> {
-    match base_type {
-        0x00 | 0x01 | 0x02 | 0x0A | 0x0B => Some(1), // enum, sint8, uint8, …
-        0x83 | 0x84 | 0x8B | 0x8C        => Some(2), // sint16, uint16, …
-        0x85 | 0x86 | 0x88 | 0x8D        => Some(4), // sint32, uint32, float32, uint32z
-        0x89 | 0x8E                       => Some(8), // float64, uint64
-        _                                 => None,
-    }
-}
-
 // ── Main entry point ──────────────────────────────────────────────────────────
 
 /// Read raw FIT bytes and extract all developer field values, keyed by the
