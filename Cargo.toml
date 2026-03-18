@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "fit-core",
+    "fit-cli",
+    # "fit-py",   # uncomment when you're ready for Python bindings
+]
+resolver = "2"
