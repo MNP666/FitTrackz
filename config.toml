@@ -1,0 +1,43 @@
+# FitTrackz default settings
+# All values here can be overridden on the command line.
+#
+# Run with no channel argument to use these defaults:
+#   cargo run --bin fit-cli -- data/raw/long_run.fit
+#
+# Override only the smoother, keeping these channels:
+#   cargo run --bin fit-cli -- data/raw/long_run.fit "" ema 0.2 1.0
+#
+# Override channels and smoother completely:
+#   cargo run --bin fit-cli -- data/raw/long_run.fit heart_rate,cadence sma 10 1.0
+
+[defaults]
+
+# Channels to extract and smooth.  These become columns in the CSV output.
+# Available channels:
+#   heart_rate, cadence, speed, power, distance, altitude,
+#   vertical_oscillation, stance_time,
+#   stride_height, stride_length,
+#   form_power, leg_spring_stiffness, air_power, impact_loading_rate
+channels = [
+    "heart_rate",
+    "cadence",
+    "stride_length",
+    "stride_height",
+    "form_power",
+    "leg_spring_stiffness",
+    "impact_loading_rate",
+    "speed",
+]
+
+# Smoothing algorithm: "sma" (moving average), "ema" (exponential), "none"
+smoother = "sma"
+
+# Parameter for the smoother.
+#   sma: window size in records (seconds).  10 = 10-second moving average.
+#   ema: alpha between 0 and 1.  Smaller = smoother but more lag.
+param = 10.0
+
+# Records below this speed (m/s) are excluded and the smoother resets.
+# 1.0 m/s (3.6 km/h) cleanly separates running from standing at a red light.
+# Remove or comment out this line to include all records.
+min_speed_ms = 2

@@ -150,4 +150,111 @@ impl FitActivity {
             .filter_map(|(i, r)| r.get_field(name).map(|v| (i, v)))
             .collect()
     }
+
+    /// Split the activity into consecutive "running" segments separated by
+    /// stops, and return the requested channel values for each segment.
+    ///
+    /// Each inner Vec is one uninterrupted stretch where speed stayed at or
+    /// above `min_speed_ms`.  The smoother can then be applied to each
+    /// segment independently so that a red-light stop does not carry stale
+    /// state into the next stretch of running.
+    ///
+    /// A record is added to the current segment only when:
+    ///   - speed is known AND above the threshold, AND
+    ///   - the requested channel has a value for that record.
+    /// When speed drops below the threshold the current segment is closed and
+    /// pushed to the output; a new segment starts as soon as speed recovers.
+    pub fn extract_channel_segmented(
+        &self,
+        name: &str,
+        min_speed_ms: f64,
+    ) -> Vec<Vec<(usize, f64)>> {
+        let mut segments: Vec<Vec<(usize, f64)>> = Vec::new();
+        let mut current:  Vec<(usize, f64)>       = Vec::new();
+
+        for (i, record) in self.records.iter().enumerate() {
+            let running = record.speed
+                .map(|s| s >= min_speed_ms)
+                .unwrap_or(false);
+
+            if running {
+                if let Some(v) = record.get_field(name) {
+                    current.push((i, v));
+                }
+            } else if !current.is_empty() {
+                // Speed fell below threshold — seal the current segment.
+                // std::mem::take swaps `current` with a fresh empty Vec and
+                // returns the old contents, avoiding a clone.
+                segments.push(std::mem::take(&mut current));
+            }
+        }
+
+        // The activity might end while still running — don't drop the last segment.
+        if !current.is_empty() {
+            segments.push(current);
+        }
+
+        segments
+    }
+
+    /// Extract **multiple channels** in a single pass over the records.
+    ///
+    /// Returns one Vec per running segment (or the whole activity as one
+    /// segment when `min_speed_ms` is `None`).  Each element of a segment is
+    /// `(record_index, values)` where `values` is a `Vec<Option<f64>>` with
+    /// one slot per channel **in the same order as `channels`**.  A slot is
+    /// `None` when that record did not carry a value for that channel.
+    ///
+    /// This avoids re-parsing or re-iterating the records once per channel.
+    /// The caller smooths each channel column independently.
+    pub fn extract_channels(
+        &self,
+        channels: &[&str],
+        min_speed_ms: Option<f64>,
+    ) -> Vec<Vec<(usize, Vec<Option<f64>>)>> {
+        // Inner helper: build one row for a record.
+        let row = |record: &FitRecord| -> Vec<Option<f64>> {
+            channels.iter().map(|&name| record.get_field(name)).collect()
+        };
+
+        match min_speed_ms {
+            // ── No speed gate: whole activity is one segment ───────────────
+            None => {
+                let data: Vec<(usize, Vec<Option<f64>>)> = self.records
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| {
+                        let vals = row(r);
+                        if vals.iter().any(|v| v.is_some()) { Some((i, vals)) } else { None }
+                    })
+                    .collect();
+                vec![data]
+            }
+
+            // ── Speed gate: split into running segments ────────────────────
+            Some(threshold) => {
+                let mut segments: Vec<Vec<(usize, Vec<Option<f64>>)>> = Vec::new();
+                let mut current:  Vec<(usize, Vec<Option<f64>>)>       = Vec::new();
+
+                for (i, record) in self.records.iter().enumerate() {
+                    let running = record.speed
+                        .map(|s| s >= threshold)
+                        .unwrap_or(false);
+
+                    if running {
+                        let vals = row(record);
+                        if vals.iter().any(|v| v.is_some()) {
+                            current.push((i, vals));
+                        }
+                    } else if !current.is_empty() {
+                        segments.push(std::mem::take(&mut current));
+                    }
+                }
+                if !current.is_empty() {
+                    segments.push(current);
+                }
+                segments
+            }
+        }
+    }
 }

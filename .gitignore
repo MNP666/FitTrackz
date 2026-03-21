@@ -4,3 +4,10 @@
 
 # data for testing
 /data
+*.csv
+
+# Python analysis workbench
+analysis/__pycache__/
+analysis/*.pyc
+*.png
+*.pdf
