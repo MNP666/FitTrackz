@@ -6,14 +6,16 @@ Python's job is plotting and iteration, not reimplementing any of that logic.
 
 Typical usage
 -------------
-from utils import run_fit, DEFAULT_FIT
+from utils import run_fit, run_fit_metadata, DEFAULT_FIT
 
-df = run_fit(DEFAULT_FIT)                          # use config.toml defaults
-df = run_fit(DEFAULT_FIT, smoother="ema", param=0.2)
-df = run_fit(DEFAULT_FIT, channels=["heart_rate", "stride_length"])
+df   = run_fit(DEFAULT_FIT)                          # use config.toml defaults
+df   = run_fit(DEFAULT_FIT, smoother="ema", param=0.2)
+df   = run_fit(DEFAULT_FIT, channels=["heart_rate", "stride_length"])
+meta = run_fit_metadata(DEFAULT_FIT)                 # dict of activity-level info
 """
 
 import io
+import json
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -100,6 +102,46 @@ def run_fit(
     df["elapsed_min"] = (df["timestamp"] - df["timestamp"].iloc[0]) / 60.0
 
     return df
+
+
+# ── Metadata wrapper ──────────────────────────────────────────────────────────
+
+def run_fit_metadata(fit_file: Path | str = DEFAULT_FIT) -> dict:
+    """
+    Run ``fit-cli <file> metadata`` and return the result as a plain dict.
+
+    Keys mirror the ``FitMetadata`` Rust struct fields:
+        manufacturer, product_name, serial_number, time_created,
+        sport, sub_sport, start_time, total_elapsed_s, total_timer_s,
+        total_distance_m, total_ascent_m, total_descent_m, total_calories,
+        avg_speed_ms, max_speed_ms, avg_heart_rate, max_heart_rate,
+        avg_cadence, avg_power_w, max_power_w, training_stress_score,
+        firmware_version
+
+    All values are either a Python scalar or ``None`` when the FIT file
+    did not include that field.
+
+    ``time_created`` and ``start_time`` are raw FIT epoch seconds
+    (seconds since 1989-12-31 00:00:00 UTC).  Add 631_065_600 to convert
+    to UNIX time, or use ``pd.to_datetime(value + 631_065_600, unit='s', utc=True)``.
+    """
+    cmd = [
+        "cargo", "run", "--release", "--bin", "fit-cli", "--",
+        str(fit_file),
+        "metadata",
+    ]
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=REPO_ROOT,
+    )
+    if not result.stdout.strip():
+        raise RuntimeError(
+            f"fit-cli metadata produced no output.\nstderr:\n{result.stderr}"
+        )
+    return json.loads(result.stdout)
 
 
 # ── Convenience helpers ───────────────────────────────────────────────────────

@@ -5,6 +5,8 @@
 //   a record might be missing altitude due to a dropout. Option<T> forces you to
 //   handle "this field might not exist" at compile time — no silent NaN surprises.
 
+use serde::Serialize;
+
 /// A single data point in an activity (one "record" message in the FIT protocol).
 /// Timestamps are raw FIT epoch seconds (seconds since 1989-12-31 00:00:00 UTC).
 #[derive(Debug, Clone)]
@@ -99,10 +101,78 @@ impl FitRecord {
 }
 
 /// The top-level container for one parsed FIT file.
+/// Sport and session-level metadata are exposed separately via `FitMetadata`.
 #[derive(Debug)]
 pub struct FitActivity {
-    pub sport:   Option<String>,
     pub records: Vec<FitRecord>,
+}
+
+// ── FitMetadata ───────────────────────────────────────────────────────────────
+
+/// Activity-level metadata extracted from non-record FIT messages:
+/// `file_id` (MesgNum 0), `session` (MesgNum 18), `device_info` (MesgNum 23).
+///
+/// Obtained by calling `fit_core::parse_fit_metadata(path)` — a separate,
+/// lightweight parse that does not decode every per-second record.
+///
+/// All fields are `Option<T>` because FIT files vary by device generation and
+/// firmware version; older devices omit some fields entirely.
+///
+/// Timestamp fields (`time_created`, `start_time`) are raw FIT epoch seconds
+/// (seconds since 1989-12-31 00:00:00 UTC).  Add `631_065_600` for UNIX time.
+#[derive(Debug, Default, Serialize)]
+pub struct FitMetadata {
+    // ── From file_id (MesgNum 0) ─────────────────────────────────────────────
+    /// Human-readable manufacturer name: "garmin", "coros", "suunto", etc.
+    pub manufacturer:   Option<String>,
+    /// Product/device name string when the file includes it (newer devices).
+    pub product_name:   Option<String>,
+    /// Device serial number.
+    pub serial_number:  Option<u32>,
+    /// When the file was created — FIT epoch seconds.
+    pub time_created:   Option<u32>,
+
+    // ── From session (MesgNum 18) ────────────────────────────────────────────
+    /// Sport type, e.g. "running", "cycling", "swimming".
+    pub sport:          Option<String>,
+    /// Sub-sport, e.g. "generic", "trail", "treadmill", "street".
+    pub sub_sport:      Option<String>,
+    /// Activity start time — FIT epoch seconds.
+    pub start_time:     Option<u32>,
+    /// Total elapsed wall-clock time including pauses, in seconds.
+    pub total_elapsed_s:        Option<f64>,
+    /// Total active timer time (excludes auto-pause), in seconds.
+    pub total_timer_s:          Option<f64>,
+    /// Total distance in metres.
+    pub total_distance_m:       Option<f64>,
+    /// Total ascent in metres.
+    pub total_ascent_m:         Option<f64>,
+    /// Total descent in metres.
+    pub total_descent_m:        Option<f64>,
+    /// Estimated calories burned.
+    pub total_calories:         Option<u16>,
+    /// Average speed in m/s.
+    pub avg_speed_ms:           Option<f64>,
+    /// Maximum speed in m/s.
+    pub max_speed_ms:           Option<f64>,
+    /// Average heart rate in bpm.
+    pub avg_heart_rate:         Option<u8>,
+    /// Maximum heart rate in bpm.
+    pub max_heart_rate:         Option<u8>,
+    /// Average cadence (steps/min or rpm depending on sport).
+    pub avg_cadence:            Option<u8>,
+    /// Maximum cadence.
+    pub max_cadence:            Option<u8>,
+    /// Average running power in watts (Stryd / Coros).
+    pub avg_power_w:            Option<u16>,
+    /// Maximum running power in watts.
+    pub max_power_w:            Option<u16>,
+    /// Training stress score (if computed by device).
+    pub training_stress_score:  Option<f64>,
+
+    // ── From device_info (MesgNum 23) ────────────────────────────────────────
+    /// Firmware version string, e.g. "4.20".
+    pub firmware_version: Option<String>,
 }
 
 impl FitActivity {

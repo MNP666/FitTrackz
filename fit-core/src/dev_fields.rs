@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use crate::models::{FitActivity, FitRecord};
+use crate::models::{FitActivity, FitMetadata, FitRecord};
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -207,14 +207,15 @@ pub fn scan_record_fields(data: &[u8]) -> Vec<FieldStat> {
 // 0xFFFFFFFF for uint32, and 0x7FFFFFFF for sint32.  We filter these out
 // before applying scale/offset so None is returned instead of a garbage value.
 
-/// Parse an entire FIT file from raw bytes and return the activity.
-/// This is the single-pass, fitparser-free replacement for parse_fit_file.
+/// Parse an entire FIT file from raw bytes and return the activity (records only).
+///
+/// Sport, session stats, and device info are in [`parse_fit_metadata_from_bytes`].
+/// This function concentrates purely on decoding the per-second Record messages.
 pub fn parse_fit_activity_from_bytes(data: &[u8]) -> FitActivity {
-    let mut sport: Option<String> = None;
     let mut records: Vec<FitRecord> = Vec::new();
 
     if data.len() < 14 {
-        return FitActivity { sport, records };
+        return FitActivity { records };
     }
 
     let header_size = data[0] as usize;
@@ -379,20 +380,6 @@ pub fn parse_fit_activity_from_bytes(data: &[u8]) -> FitActivity {
                     }
                 }
 
-                // ── Sport (12) — gives the activity type string ────────────
-                12 => {
-                    if let Some((bytes, _)) = std_bytes.get(&0) {
-                        if let Some(&b) = bytes.first() {
-                            sport = Some(match b {
-                                1  => "running".to_string(),
-                                2  => "cycling".to_string(),
-                                5  => "swimming".to_string(),
-                                _  => format!("sport_{b}"),
-                            });
-                        }
-                    }
-                }
-
                 // ── Record (20) — one second of sensor data ────────────────
                 20 => {
                     // Full-timestamp records carry field 253.
@@ -418,7 +405,427 @@ pub fn parse_fit_activity_from_bytes(data: &[u8]) -> FitActivity {
         }
     }
 
-    FitActivity { sport, records }
+    FitActivity { records }
+}
+
+// ── Metadata parser ───────────────────────────────────────────────────────────
+//
+// Uses two independent passes to avoid byte-sync issues with Coros proprietary
+// message types that appear in the middle of the file:
+//
+//   Pass 1 (forward scan)  — extracts file_id (MesgNum 0) and device_info
+//                            (MesgNum 23), which always appear near the start.
+//                            Stops as soon as both are found.
+//
+//   Pass 2 (pattern search) — locates the session message (MesgNum 18) by
+//                             scanning backwards for its definition-message
+//                             byte pattern.  Session messages are always near
+//                             the end of a FIT file.  This approach is immune
+//                             to mid-file proprietary records breaking sync.
+
+/// Parse activity-level metadata from raw FIT bytes.
+pub fn parse_fit_metadata_from_bytes(data: &[u8]) -> FitMetadata {
+    let mut meta = FitMetadata::default();
+
+    if data.len() < 14 {
+        return meta;
+    }
+
+    let header_size = data[0] as usize;
+    let data_size   = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let end         = (header_size + data_size).min(data.len());
+
+    // ── Pass 1: forward scan for file_id and device_info ─────────────────────
+    meta_forward_scan(data, header_size, end, &mut meta);
+
+    // ── Pass 2: backwards pattern search for session ──────────────────────────
+    meta_find_session(data, header_size, end, &mut meta);
+
+    meta
+}
+
+/// Forward scan for file_id (MesgNum 0) and device_info (MesgNum 23).
+/// Stops as soon as both are found, or when byte-sync is lost.
+fn meta_forward_scan(data: &[u8], hdr: usize, end: usize, meta: &mut FitMetadata) {
+    type StdLayout = Vec<(u8, usize, u8)>;
+    type DevLayout = Vec<(u8, u8, usize)>;
+    let mut definitions: HashMap<u8, (u16, StdLayout, DevLayout, bool)> = HashMap::new();
+    let mut pos = hdr;
+
+    while pos < end {
+        if pos >= data.len() { break; }
+        // Early exit once both file_id and device_info have been decoded.
+        if meta.manufacturer.is_some() && meta.product_name.is_some()
+            && meta.time_created.is_some()
+        {
+            break;
+        }
+
+        let header = data[pos]; pos += 1;
+
+        // Compressed timestamp — advance past the payload.
+        if header & 0x80 != 0 {
+            let lt = (header >> 5) & 0x03;
+            if let Some((_, std_fields, dev_refs, _)) = definitions.get(&lt) {
+                for (_, fsize, _) in std_fields.clone() { pos += fsize; }
+                for (_, _, fsize) in dev_refs.clone()   { pos += fsize; }
+            } else {
+                break; // lost sync — file_id is always before this point anyway
+            }
+            continue;
+        }
+
+        let local_type = header & 0x0F;
+        let is_def     = header & 0x40 != 0;
+        let has_dev    = header & 0x20 != 0;
+
+        if is_def {
+            if pos + 5 > end { break; }
+            pos += 1; // reserved
+            let big_endian = data[pos] != 0; pos += 1;
+            let global     = read_u16(&data[pos..], big_endian); pos += 2;
+            let num_fields = data[pos] as usize; pos += 1;
+            // Sanity check: a garbage num_fields would skip too many bytes.
+            if num_fields > 64 { break; }
+
+            let mut std_fields: StdLayout = Vec::with_capacity(num_fields);
+            for _ in 0..num_fields {
+                if pos + 3 > end { break; }
+                std_fields.push((data[pos], data[pos + 1] as usize, data[pos + 2]));
+                pos += 3;
+            }
+
+            let mut dev_refs: DevLayout = Vec::new();
+            if has_dev && pos < end {
+                let num_dev = data[pos] as usize; pos += 1;
+                if num_dev > 32 { break; }
+                for _ in 0..num_dev {
+                    if pos + 3 > end { break; }
+                    dev_refs.push((data[pos], data[pos + 1], data[pos + 2] as usize));
+                    pos += 3;
+                }
+            }
+
+            definitions.insert(local_type, (global, std_fields, dev_refs, big_endian));
+        } else {
+            let Some((global, std_fields, dev_refs, big_endian)) =
+                definitions.get(&local_type)
+            else {
+                break; // lost sync
+            };
+            let (global, big_endian) = (*global, *big_endian);
+            let std_fields = std_fields.clone();
+            let dev_refs   = dev_refs.clone();
+
+            let mut fields: HashMap<u8, Vec<u8>> = HashMap::new();
+            for (fnum, fsize, _) in &std_fields {
+                if pos + fsize > end { break; }
+                fields.insert(*fnum, data[pos..pos + fsize].to_vec());
+                pos += fsize;
+            }
+            for (_, _, fsize) in &dev_refs {
+                if pos + fsize > end { break; }
+                pos += fsize;
+            }
+
+            match global {
+                0  => decode_file_id(&fields, big_endian, meta),
+                23 => decode_device_info(&fields, big_endian, meta),
+                _  => {}
+            }
+        }
+    }
+}
+
+/// Scan backwards through the raw bytes looking for a definition-message
+/// byte pattern for MesgNum 18 (session).  A valid definition header for
+/// global message N looks like:
+///
+///   byte 0: 0x40–0x4F or 0x60–0x6F   (bit7=0, bit6=1; bit5 optional for dev)
+///   byte 1: 0x00                       (reserved, always zero)
+///   byte 2: 0x00 or 0x01               (endianness)
+///   byte 3: lo(N)                       (global mesg num, little-endian)
+///   byte 4: hi(N)
+///   byte 5: num_fields                  (1–50 for sanity)
+///
+/// The probability of this 6-byte pattern appearing at random is ≈ 10⁻⁹ per
+/// position, so false positives in a 500 KB file are essentially impossible.
+fn meta_find_session(data: &[u8], hdr: usize, end: usize, meta: &mut FitMetadata) {
+    if end < hdr + 6 { return; }
+
+    // Scan backwards from the end; session definition is always near the end.
+    let def_pos = (hdr..end - 5).rev().find(|&p| {
+        let b = data[p];
+        b & 0xC0 == 0x40          // definition header (bit7=0, bit6=1)
+            && data[p + 1] == 0x00    // reserved
+            && data[p + 2] <= 1       // endian
+            && data[p + 3] == 0x12    // global = 18 LE
+            && data[p + 4] == 0x00
+            && {
+                let nf = data[p + 5] as usize;
+                nf >= 1 && nf <= 50   // sanity: real sessions have 5–30 fields
+            }
+    });
+
+    let Some(def_pos) = def_pos else { return; };
+
+    // Parse the definition.
+    let local_type = data[def_pos] & 0x0F;
+    let has_dev    = data[def_pos] & 0x20 != 0;
+    let big_endian = data[def_pos + 2] != 0;
+    let num_fields = data[def_pos + 5] as usize;
+
+    let mut pos = def_pos + 6; // skip header(1) + reserved(1) + endian(1) + global(2) + num_f(1)
+
+    let mut std_fields: Vec<(u8, usize, u8)> = Vec::with_capacity(num_fields);
+    for _ in 0..num_fields {
+        if pos + 3 > end { return; }
+        std_fields.push((data[pos], data[pos + 1] as usize, data[pos + 2]));
+        pos += 3;
+    }
+
+    if has_dev && pos < end {
+        let num_dev = data[pos] as usize; pos += 1;
+        for _ in 0..num_dev {
+            if pos + 3 > end { return; }
+            pos += 3; // skip dev field descriptors — we don't need them for session
+        }
+    }
+
+    // The data record must follow immediately.
+    // Header byte for a plain data record: 0x00 | local_type.
+    if pos >= end { return; }
+    let data_hdr = data[pos]; pos += 1;
+    if data_hdr & 0xC0 != 0x00 || data_hdr & 0x0F != local_type {
+        return; // unexpected — bail out
+    }
+
+    // Read field bytes.
+    let mut fields: HashMap<u8, Vec<u8>> = HashMap::new();
+    for (fnum, fsize, _) in &std_fields {
+        if pos + fsize > end { return; }
+        fields.insert(*fnum, data[pos..pos + fsize].to_vec());
+        pos += fsize;
+    }
+
+    decode_session(&fields, big_endian, meta);
+}
+
+// ── Message decoders ──────────────────────────────────────────────────────────
+
+fn decode_file_id(fields: &HashMap<u8, Vec<u8>>, big_endian: bool, meta: &mut FitMetadata) {
+    // Field 1: manufacturer (uint16)
+    if let Some(b) = fields.get(&1) {
+        if b.len() >= 2 {
+            let v = read_u16(b, big_endian);
+            if v != 0xFFFF { meta.manufacturer = Some(fit_manufacturer_name(v)); }
+        }
+    }
+    // Field 3: serial_number (uint32z)
+    if let Some(b) = fields.get(&3) {
+        if b.len() >= 4 {
+            let v = read_u32(b, big_endian);
+            if v != 0 && v != 0xFFFFFFFF { meta.serial_number = Some(v); }
+        }
+    }
+    // Field 4: time_created (uint32, FIT epoch)
+    if let Some(b) = fields.get(&4) {
+        if b.len() >= 4 {
+            let v = read_u32(b, big_endian);
+            if v != 0xFFFFFFFF { meta.time_created = Some(v); }
+        }
+    }
+    // Field 8: product_name (string, up to 20 bytes) — present on newer devices
+    if let Some(b) = fields.get(&8) {
+        let s: String = b.iter().take_while(|&&x| x != 0).map(|&x| x as char).collect();
+        if !s.is_empty() { meta.product_name = Some(s); }
+    }
+}
+
+fn decode_session(fields: &HashMap<u8, Vec<u8>>, big_endian: bool, meta: &mut FitMetadata) {
+    // Field 2: start_time (uint32, FIT epoch)
+    if let Some(b) = fields.get(&2) {
+        if b.len() >= 4 {
+            let v = read_u32(b, big_endian);
+            if v != 0xFFFFFFFF { meta.start_time = Some(v); }
+        }
+    }
+    // Field 5: sport (uint8)
+    if let Some(b) = fields.get(&5) {
+        if let Some(&v) = b.first() {
+            if v != 0xFF { meta.sport = Some(fit_sport_name(v)); }
+        }
+    }
+    // Field 6: sub_sport (uint8)
+    if let Some(b) = fields.get(&6) {
+        if let Some(&v) = b.first() {
+            if v != 0xFF { meta.sub_sport = Some(fit_sub_sport_name(v)); }
+        }
+    }
+    // Field 7: total_elapsed_time (uint32, scale=1000 → ms, divide for seconds)
+    if let Some(b) = fields.get(&7) {
+        if b.len() >= 4 {
+            let v = read_u32(b, big_endian);
+            if v != 0xFFFFFFFF { meta.total_elapsed_s = Some(v as f64 / 1000.0); }
+        }
+    }
+    // Field 8: total_timer_time (uint32, scale=1000)
+    if let Some(b) = fields.get(&8) {
+        if b.len() >= 4 {
+            let v = read_u32(b, big_endian);
+            if v != 0xFFFFFFFF { meta.total_timer_s = Some(v as f64 / 1000.0); }
+        }
+    }
+    // Field 9: total_distance (uint32, scale=100 → cm, divide for metres)
+    if let Some(b) = fields.get(&9) {
+        if b.len() >= 4 {
+            let v = read_u32(b, big_endian);
+            if v != 0xFFFFFFFF { meta.total_distance_m = Some(v as f64 / 100.0); }
+        }
+    }
+    // Field 11: total_calories (uint16, kcal)
+    if let Some(b) = fields.get(&11) {
+        if b.len() >= 2 {
+            let v = read_u16(b, big_endian);
+            if v != 0xFFFF { meta.total_calories = Some(v); }
+        }
+    }
+    // Field 14: avg_speed (uint16, scale=1000 → m/s)
+    if let Some(b) = fields.get(&14) {
+        if b.len() >= 2 {
+            let v = read_u16(b, big_endian);
+            if v != 0xFFFF { meta.avg_speed_ms = Some(v as f64 / 1000.0); }
+        }
+    }
+    // Field 15: max_speed (uint16, scale=1000 → m/s)
+    if let Some(b) = fields.get(&15) {
+        if b.len() >= 2 {
+            let v = read_u16(b, big_endian);
+            if v != 0xFFFF { meta.max_speed_ms = Some(v as f64 / 1000.0); }
+        }
+    }
+    // Field 16: avg_heart_rate (uint8, bpm)
+    if let Some(b) = fields.get(&16) {
+        if let Some(&v) = b.first() {
+            if v != 0xFF { meta.avg_heart_rate = Some(v); }
+        }
+    }
+    // Field 17: max_heart_rate (uint8, bpm)
+    if let Some(b) = fields.get(&17) {
+        if let Some(&v) = b.first() {
+            if v != 0xFF { meta.max_heart_rate = Some(v); }
+        }
+    }
+    // Field 18: avg_cadence (uint8, spm)
+    if let Some(b) = fields.get(&18) {
+        if let Some(&v) = b.first() {
+            if v != 0xFF { meta.avg_cadence = Some(v); }
+        }
+    }
+    // Field 19: max_cadence (uint8, spm)
+    if let Some(b) = fields.get(&19) {
+        if let Some(&v) = b.first() {
+            if v != 0xFF { meta.max_cadence = Some(v); }
+        }
+    }
+    // Field 20: avg_power (uint16, W)
+    if let Some(b) = fields.get(&20) {
+        if b.len() >= 2 {
+            let v = read_u16(b, big_endian);
+            if v != 0xFFFF { meta.avg_power_w = Some(v); }
+        }
+    }
+    // Field 21: max_power (uint16, W)
+    if let Some(b) = fields.get(&21) {
+        if b.len() >= 2 {
+            let v = read_u16(b, big_endian);
+            if v != 0xFFFF { meta.max_power_w = Some(v); }
+        }
+    }
+    // Field 22: total_ascent (uint16, metres)
+    if let Some(b) = fields.get(&22) {
+        if b.len() >= 2 {
+            let v = read_u16(b, big_endian);
+            if v != 0xFFFF { meta.total_ascent_m = Some(v as f64); }
+        }
+    }
+    // Field 23: total_descent (uint16, metres)
+    if let Some(b) = fields.get(&23) {
+        if b.len() >= 2 {
+            let v = read_u16(b, big_endian);
+            if v != 0xFFFF { meta.total_descent_m = Some(v as f64); }
+        }
+    }
+    // Field 35: training_stress_score (FIT SDK standard — uint16, scale=10, units=tss)
+    // Field 91: training_stress_score on Coros devices (same encoding, scale=10)
+    // Try field 35 first; fall back to field 91 for Coros.
+    let tss_bytes = fields.get(&35).or_else(|| fields.get(&91));
+    if let Some(b) = tss_bytes {
+        if b.len() >= 2 {
+            let v = read_u16(b, big_endian);
+            if v != 0xFFFF { meta.training_stress_score = Some(v as f64 / 10.0); }
+        }
+    }
+}
+
+fn decode_device_info(fields: &HashMap<u8, Vec<u8>>, big_endian: bool, meta: &mut FitMetadata) {
+    // Field 5: software_version (uint16, scale=100 → e.g. 420 = "4.20")
+    // Field 4 is the product/model number — software_version is field 5.
+    // Only capture the first device_info record (the main watch unit).
+    if meta.firmware_version.is_none() {
+        if let Some(b) = fields.get(&5) {
+            if b.len() >= 2 {
+                let v = read_u16(b, big_endian);
+                if v != 0xFFFF && v != 0 {
+                    let major = v / 100;
+                    let minor = v % 100;
+                    meta.firmware_version = Some(format!("{major}.{minor:02}"));
+                }
+            }
+        }
+    }
+}
+
+// ── FIT profile lookup tables ─────────────────────────────────────────────────
+
+fn fit_manufacturer_name(code: u16) -> String {
+    match code {
+        1   => "garmin".to_string(),
+        7   => "dynastream".to_string(),
+        9   => "suunto".to_string(),
+        46  => "polar".to_string(),
+        76  => "wahoo_fitness".to_string(),
+        255 => "development".to_string(),
+        263 => "coros".to_string(),
+        _   => format!("manufacturer_{code}"),
+    }
+}
+
+fn fit_sport_name(code: u8) -> String {
+    match code {
+        0  => "generic".to_string(),
+        1  => "running".to_string(),
+        2  => "cycling".to_string(),
+        3  => "transition".to_string(),
+        4  => "fitness_equipment".to_string(),
+        5  => "swimming".to_string(),
+        11 => "football".to_string(),
+        17 => "hiking".to_string(),
+        _  => format!("sport_{code}"),
+    }
+}
+
+fn fit_sub_sport_name(code: u8) -> String {
+    match code {
+        0  => "generic".to_string(),
+        1  => "treadmill".to_string(),
+        2  => "street".to_string(),
+        3  => "trail".to_string(),
+        4  => "track".to_string(),
+        17 => "spin".to_string(),
+        45 => "indoor_running".to_string(),
+        _  => format!("sub_sport_{code}"),
+    }
 }
 
 // ── FitRecord builder ─────────────────────────────────────────────────────────

@@ -11,8 +11,8 @@
 
 use std::{fs, path::Path};
 
-use crate::dev_fields::parse_fit_activity_from_bytes;
-use crate::models::{FitActivity, FitRecord};
+use crate::dev_fields::{parse_fit_activity_from_bytes, parse_fit_metadata_from_bytes};
+use crate::models::{FitActivity, FitMetadata, FitRecord};
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -34,6 +34,22 @@ pub enum ParseError {
 pub fn parse_fit_file<P: AsRef<Path>>(path: P) -> Result<FitActivity, ParseError> {
     let data = fs::read(path)?;
     Ok(parse_fit_activity_from_bytes(&data))
+}
+
+/// Parse activity-level metadata from a `.fit` file.
+///
+/// This is a lightweight parse — it reads only `file_id` (MesgNum 0),
+/// `session` (MesgNum 18), and `device_info` (MesgNum 23) messages,
+/// skipping all per-second Record messages entirely.
+///
+/// # Example
+/// ```no_run
+/// let meta = fit_core::parse_fit_metadata("my_run.fit").unwrap();
+/// println!("{:?}", meta.manufacturer);  // Some("garmin")
+/// ```
+pub fn parse_fit_metadata<P: AsRef<Path>>(path: P) -> Result<FitMetadata, ParseError> {
+    let data = fs::read(path)?;
+    Ok(parse_fit_metadata_from_bytes(&data))
 }
 
 /// Return a human-readable dump of `max_records` representative Record

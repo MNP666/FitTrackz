@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 thiserror = "1"   # ergonomic custom error types
+serde     = { version = "1", features = ["derive"] }  # FitMetadata serialisation (needed for PyO3 later too)

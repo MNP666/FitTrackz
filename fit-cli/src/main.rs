@@ -24,10 +24,12 @@
 
 use std::{env, fs, process};
 
+use serde_json;
+
 use serde::Deserialize;
 
 use fit_core::{
-    dump_raw_records, parse_fit_file, scan_record_fields,
+    dump_raw_records, parse_fit_file, parse_fit_metadata, scan_record_fields,
     smoothing::{ExponentialMA, MovingAverage, Smoother},
 };
 
@@ -101,6 +103,24 @@ fn main() {
 
     // ── Diagnostic modes ──────────────────────────────────────────────────────
 
+    // ── Metadata mode ─────────────────────────────────────────────────────────
+    // fit-cli <file.fit> metadata
+    // Outputs a JSON object with file_id, session, and device_info fields.
+    // Used by ViewTrackz to populate the database without a full records parse.
+
+    if channel == "metadata" {
+        match parse_fit_metadata(path) {
+            Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
+            Ok(meta) => {
+                match serde_json::to_string_pretty(&meta) {
+                    Ok(json) => println!("{json}"),
+                    Err(e)   => { eprintln!("Serialisation error: {e}"); process::exit(1); }
+                }
+            }
+        }
+        return;
+    }
+
     if channel == "scan" {
         let raw = match fs::read(path) {
             Ok(b)  => b,
@@ -162,9 +182,7 @@ fn main() {
         Err(e) => { eprintln!("Error: {e}"); process::exit(1); }
     };
 
-    eprintln!("Loaded {} records  |  sport: {}",
-        activity.records.len(),
-        activity.sport.as_deref().unwrap_or("unknown"));
+    eprintln!("Loaded {} records", activity.records.len());
 
     if let Some(t) = min_speed {
         eprintln!("Speed filter: {t:.1} m/s — smoother resets at each stop");
