@@ -1,8 +1,10 @@
 # Parsing FIT Metadata from Coros Devices: What Went Wrong and What Finally Worked
 
-This documents the debugging journey of extracting activity-level metadata (manufacturer, device name, session stats) from `.fit` files produced by a **Coros Pace Pro**. The goal was to implement a lightweight `fit-cli <file> metadata` subcommand in Rust that outputs a JSON object without parsing every per-second record.
+This documents the debugging journey of extracting activity-level metadata (manufacturer, device name, session stats) from `.fit` files produced by a **Coros Pace Pro** paired with a **Stryd running pod**. The goal was to implement a lightweight `fit-cli <file> metadata` subcommand in Rust that outputs a JSON object without parsing every per-second record.
 
 The solution is now in `fit-core/src/dev_fields.rs` (`parse_fit_metadata_from_bytes`). This write-up exists so you don't have to retrace the same steps.
+
+> **Note on Stryd vs native Coros fields.** The session metadata discussed here is written by the Coros watch itself — it has nothing to do with the Stryd pod. The Stryd pod contributes *per-second developer fields* (`form_power`, `leg_spring_stiffness`, `air_power`, `impact_loading_rate`) to the Record messages (MesgNum 20). Those fields are absent when running without a Stryd but the session message is identical either way. The native Coros running dynamics (`stride_height` at FIT field 83, `stride_length` at FIT field 85) are also written by the watch itself and do not require Stryd.
 
 ---
 
@@ -133,7 +135,7 @@ This approach is completely immune to mid-file Coros proprietary messages.
 
 The other half of the debugging was getting the **field numbers** right for the session message. The FIT SDK's `Profile.xlsx` is the authoritative reference, but some numbers had been entered incorrectly in the initial implementation.
 
-The following were verified by decoding the actual binary data from a real Coros Pace Pro file:
+The following were verified by decoding actual binary data from a Coros Pace Pro paired with a Stryd pod. **The session and device_info fields below are written by the Coros watch itself** and will be present on any Coros device, with or without Stryd.
 
 ### `file_id` (MesgNum 0)
 
